@@ -2,3 +2,4 @@ git+https://github.com/TMiguelT/sphinxcontrib-restbuilder
 sphinx
 sphinx-autodoc-annotation
 .
+pandas==0.25.3

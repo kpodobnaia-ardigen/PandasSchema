@@ -1,6 +1,7 @@
 import pandas as pd
 import typing
 
+from . import validation_df
 from .errors import PanSchInvalidSchemaError, PanSchArgumentError
 from .validation_warning import ValidationWarning
 from .column import Column
@@ -9,14 +10,17 @@ from .column import Column
 class Schema:
     """
     A schema that defines the columns required in the target DataFrame
+
+    :param columns: A list of column objects
+    :param validations: A list of Schema-level validations
+    :param ordered: True if the Schema should associate its Columns with DataFrame columns
+                    by position only, ignoring the header names. False if the columns should be
+                    associated by column header names only. Defaults to False
     """
 
-    def __init__(self, columns: typing.Iterable[Column], ordered: bool = False):
-        """
-        :param columns: A list of column objects
-        :param ordered: True if the Schema should associate its Columns with DataFrame columns by position only, ignoring
-            the header names. False if the columns should be associated by column header names only. Defaults to False
-        """
+    def __init__(self, columns: typing.Iterable[Column],
+                 validations: typing.Iterable['validation_df._BaseValidation'] = [],
+                 ordered: bool = False):
         if not columns:
             raise PanSchInvalidSchemaError('An instance of the schema class must have a columns list')
 
@@ -28,6 +32,7 @@ class Schema:
 
         self.columns = list(columns)
         self.ordered = ordered
+        self.validations = list(validations)
 
     def validate(self, df: pd.DataFrame, columns: typing.List[str] = None) -> typing.List[ValidationWarning]:
         """
@@ -38,53 +43,38 @@ class Schema:
         :return: A list of ValidationWarning objects that list the ways in which the DataFrame was invalid
         """
         errors = []
-        df_cols = len(df.columns)
 
-        # If no columns are passed, validate against every column in the schema. This is the default behaviour
-        if columns is None:
-            schema_cols = len(self.columns)
-            columns_to_pair = self.columns
-            if df_cols != schema_cols:
-                errors.append(
-                    ValidationWarning(
-                        'Invalid number of columns. The schema specifies {}, but the data frame has {}'.format(
-                            schema_cols,
-                            df_cols)
-                    )
-                )
-                return errors
+        # TODO: headers validations
 
-        # If we did pass in columns, check that they are part of the current schema
-        else:
-            if set(columns).issubset(self.get_column_names()):
-                columns_to_pair = [column for column in self.columns if column.name in columns]
-            else:
+        if columns:
+            if not set(columns).issubset(self.get_column_names()):
                 raise PanSchArgumentError(
-                    'Columns {} passed in are not part of the schema'.format(set(columns).difference(self.columns))
+                    'Columns {} passed in are not part of the schema'.format(
+                        set(columns).difference(self.columns))
                 )
-
-        # We associate the column objects in the schema with data frame series either by name or by position, depending
-        # on the value of self.ordered
-        if self.ordered:
-            series = [x[1] for x in df.iteritems()]
-            column_pairs = zip(series, self.columns)
+            validating_columns = [column for column in self.columns if column.name in columns]
         else:
-            column_pairs = []
-            for column in columns_to_pair:
+            validating_columns = self.columns
+            # self._validate_number_of_columns(df)
 
-                # Throw an error if the schema column isn't in the data frame
-                if column.name not in df:
-                    errors.append(ValidationWarning(
-                        'The column {} exists in the schema but not in the data frame'.format(column.name)))
-                    return errors
+        for schema_column in validating_columns:
+            errors += schema_column.validate(df)
 
-                column_pairs.append((df[column.name], column))
-
-        # Iterate over each pair of schema columns and data frame series and run validations
-        for series, column in column_pairs:
-            errors += column.validate(series)
+        for schema_validation in self.validations:
+            errors += schema_validation.get_errors(df)
 
         return sorted(errors, key=lambda e: e.row)
+
+    def _validate_number_of_columns(self, df):
+        schema_cols = len(self.columns)
+        df_cols = len(df.columns)
+
+        if df_cols != schema_cols:
+            return [ValidationWarning('Invalid number of columns. The schema specifies {}, '
+                                      'but the data frame has {}'.format(schema_cols, df_cols))]
+
+    def _validate_columns_in_schema(self):
+        pass
 
     def get_column_names(self):
         """
