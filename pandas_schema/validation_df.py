@@ -1,15 +1,11 @@
 import abc
-import math
-import datetime
 import pandas as pd
 import numpy as np
 import typing
 import operator
 
-from . import column
 from .validation_warning import ValidationWarning
 from .errors import PanSchArgumentError
-from pandas.api.types import is_categorical_dtype, is_numeric_dtype
 
 
 class _BaseValidation:
@@ -19,10 +15,11 @@ class _BaseValidation:
     __metaclass__ = abc.ABCMeta
 
     @abc.abstractmethod
-    def get_errors(self, df: pd.DataFrame) -> typing.Iterable[ValidationWarning]:
+    def get_errors(self, df: pd.DataFrame, allow_empty) -> typing.Iterable[ValidationWarning]:
         """
         Return a list of errors in the given series
         :param df:
+        :param allow_empty:
         :return:
         """
 
@@ -78,11 +75,15 @@ class _DataFrameValidation(_BaseValidation):
         """
         return _CombinedValidation(self, other, operator.and_)
 
-    def get_errors(self, df: pd.DataFrame):
+    def get_errors(self, df: pd.DataFrame, allow_empty: bool = False):
         if self.columns:
             df = df[self.columns]
 
         validation_results_per_row = ~self.validate(df)
+
+        if allow_empty:
+            empty_validation_results = EmptyValuesValidation().validate(df)
+            validation_results_per_row = empty_validation_results & validation_results_per_row
 
         invalid_rows = df[validation_results_per_row]
 
@@ -170,3 +171,117 @@ class DuplicatedRowsValidation(_DataFrameValidation):
 
     def validate(self, df: pd.DataFrame) -> pd.Series:
         return ~df.duplicated(subset=self.columns or df.columns)
+
+
+class CanCallValidation(_DataFrameValidation):
+    """
+    Validates if a given function can be called on each element in a column without raising an exception
+    """
+
+    def __init__(self, func: typing.Callable, **kwargs):
+        """
+        :param func: A python function that will be called with the value of each cell in the DataFrame. If this
+            function throws an error, this cell is considered to have failed the validation. Otherwise it has passed.
+        """
+        if callable(func):
+            self.callable = func
+        else:
+            raise PanSchArgumentError('The object "{}" passed to CanCallValidation is not callable!'.format(type))
+        super().__init__(**kwargs)
+
+    @property
+    def default_message(self):
+        return 'raised an exception when the callable {} was called on it'.format(self.callable)
+
+    def can_call(self, func_arg):
+        try:
+            self.callable(func_arg)
+            return True
+        except:
+            return False
+
+    def validate(self, df: pd.DataFrame) -> pd.Series:
+        return df.apply(self.can_call, axis=1)
+
+
+class CanConvertValidation(CanCallValidation):
+    """
+    Checks if each element in a column can be converted to a Python object type
+    """
+
+    """
+    Internally this uses the same logic as CanCallValidation since all types are callable in python.
+    However this class overrides the error messages to make them more directed towards types
+    """
+
+    def __init__(self, _type: type, **kwargs):
+        """
+        :param _type: Any python type. Its constructor will be called with the value of the individual cell as its
+            only argument. If it throws an exception, the value is considered to fail the validation, otherwise it has passed
+        """
+        if isinstance(_type, type):
+            super().__init__(_type, **kwargs)
+        else:
+            raise PanSchArgumentError('{} is not a valid type'.format(_type))
+
+    @property
+    def default_message(self):
+        return 'cannot be converted to type {}'.format(self.callable)
+
+
+class MatchesPatternValidation(_DataFrameValidation):
+    """
+    Validates that a string or regular expression can match somewhere in each element in this column
+    """
+
+    def __init__(self, pattern, options=None, **kwargs):
+        """
+        :param kwargs: Arguments to pass to Series.str.contains
+            (http://pandas.pydata.org/pandas-docs/stable/generated/pandas.Series.str.contains.html)
+            pat is the only required argument
+        """
+        self.pattern = pattern
+        self.options = options or {}
+
+        super().__init__(**kwargs)
+
+    @property
+    def default_message(self):
+        return 'does not match the pattern "{}"'.format(self.pattern)
+
+    def validate(self, df: pd.DataFrame) -> pd.Series:
+        return df.apply(lambda series: series.astype(str).str.contains(self.pattern, **self.options), axis=1)
+
+
+class LeadingWhitespaceValidation(MatchesPatternValidation):
+    """
+    Checks that there is no leading whitespace in this column
+    """
+    def __init__(self, **kwargs):
+        super().__init__(pattern=r'^\s+', **kwargs)
+
+    @property
+    def default_message(self):
+        return 'contains leading whitespace'
+
+
+class TrailingWhitespaceValidation(MatchesPatternValidation):
+    """
+    Checks that there is no trailing whitespace in this column
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(pattern=r'\s+$', **kwargs)
+
+    @property
+    def default_message(self):
+        return 'contains trailing whitespace'
+
+
+class EmptyValuesValidation(_DataFrameValidation):
+    """
+    Returns False when there is an empty value in a row.
+    """
+    def validate(self, df: pd.DataFrame) -> pd.Series:
+        df = df.replace(r'^\s*$', np.nan, regex=True)
+        return ~df.isnull().all(axis=1)
