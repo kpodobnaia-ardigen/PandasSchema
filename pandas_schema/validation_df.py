@@ -1,4 +1,7 @@
 import abc
+import datetime
+import math
+
 import pandas as pd
 import numpy as np
 import typing
@@ -32,7 +35,7 @@ class _DataFrameValidation(_BaseValidation):
     __metaclass__ = abc.ABCMeta
 
     def __init__(self, columns=None, **kwargs):
-        self._custom_message = kwargs.get('error_message')
+        self._custom_message = kwargs.get('message')
         self.columns = columns
 
     @property
@@ -96,7 +99,7 @@ class _DataFrameValidation(_BaseValidation):
                 message=self.message,
                 value=row,
                 row=index,
-                column=', '.join(list(df.keys()))
+                column=', '.join(list(df.keys().astype('str')))
             ))
 
         return errors
@@ -151,7 +154,7 @@ class IsDtypeValidation(_DataFrameValidation):
         super().__init__(**kwargs)
 
     def validate(self, df: pd.DataFrame) -> pd.Series:
-        return df.apply(np.issubdtype, axis=1, arg2=np.dtype('int64'))
+        return df.apply(lambda series: np.issubdtype(series.dtype, self.dtype), axis=1)
 
     @property
     def default_message(self):
@@ -201,7 +204,7 @@ class CanCallValidation(_DataFrameValidation):
             return False
 
     def validate(self, df: pd.DataFrame) -> pd.Series:
-        return df.apply(self.can_call, axis=1)
+        return df.apply(lambda series: series.apply(self.can_call), axis=1).all(axis=1)
 
 
 class CanConvertValidation(CanCallValidation):
@@ -250,7 +253,7 @@ class MatchesPatternValidation(_DataFrameValidation):
         return 'does not match the pattern "{}"'.format(self.pattern)
 
     def validate(self, df: pd.DataFrame) -> pd.Series:
-        return df.apply(lambda series: series.astype(str).str.contains(self.pattern, **self.options), axis=1)
+        return df.apply(lambda series: series.astype(str).str.contains(self.pattern, **self.options), axis=1).all(axis=1)
 
 
 class LeadingWhitespaceValidation(MatchesPatternValidation):
@@ -263,6 +266,9 @@ class LeadingWhitespaceValidation(MatchesPatternValidation):
     @property
     def default_message(self):
         return 'contains leading whitespace'
+
+    def validate(self, df: pd.DataFrame) -> pd.Series:
+        return ~super().validate(df)
 
 
 class TrailingWhitespaceValidation(MatchesPatternValidation):
@@ -277,6 +283,9 @@ class TrailingWhitespaceValidation(MatchesPatternValidation):
     def default_message(self):
         return 'contains trailing whitespace'
 
+    def validate(self, df: pd.DataFrame) -> pd.Series:
+        return ~super().validate(df)
+
 
 class EmptyValuesValidation(_DataFrameValidation):
     """
@@ -285,3 +294,133 @@ class EmptyValuesValidation(_DataFrameValidation):
     def validate(self, df: pd.DataFrame) -> pd.Series:
         df = df.replace(r'^\s*$', np.nan, regex=True)
         return ~df.isnull().all(axis=1)
+
+
+class CustomSeriesValidation(_DataFrameValidation):
+    """
+    Validates using a user-provided function that operates on an entire series (for example by using one of the pandas
+    Series methods: http://pandas.pydata.org/pandas-docs/stable/api.html#series)
+    """
+
+    def __init__(self, validation: typing.Callable[[pd.DataFrame], pd.Series], message: str):
+        """
+        :param message: The error message to provide to the user if this validation fails. The row and column and
+            failing value will automatically be prepended to this message, so you only have to provide a message that
+            describes what went wrong, for example 'failed my validation' will become
+
+            {row: 1, column: "Column Name"}: "Value" failed my validation
+        :param validation: A function that takes a pandas Series and returns a boolean Series, where each cell is equal
+            to True if the object passed validation, and False if it failed
+        """
+        self._validation = validation
+        super().__init__(message=message)
+
+    def validate(self, df: pd.DataFrame) -> pd.Series:
+        return df.apply(self._validation, axis=1).all(axis=1)
+
+
+class CustomElementValidation(_DataFrameValidation):
+    """
+    Validates using a user-provided function that operates on each element
+    """
+
+    def __init__(self, validation: typing.Callable[[typing.Any], typing.Any], message: str):
+        """
+        :param message: The error message to provide to the user if this validation fails. The row and column and
+            failing value will automatically be prepended to this message, so you only have to provide a message that
+            describes what went wrong, for example 'failed my validation' will become
+
+            {row: 1, column: "Column Name"}: "Value" failed my validation
+        :param validation: A function that takes the value of a data frame cell and returns True if it passes the
+            the validation, and false if it doesn't
+        """
+        self._validation = validation
+        super().__init__(message=message)
+
+    def validate(self, df: pd.DataFrame) -> pd.Series:
+        return df.apply(lambda series: series.apply(self._validation), axis=1).all(axis=1)
+
+
+class InListValidation(_DataFrameValidation):
+    """
+    Checks that each element in this column is contained within a list of possibilities
+    """
+
+    def __init__(self, options: typing.Iterable, case_sensitive: bool = True, **kwargs):
+        """
+        :param options: A list of values to check. If the value of a cell is in this list, it is considered to pass the
+            validation
+        """
+        self.case_sensitive = case_sensitive
+        self.options = options
+
+        super().__init__(**kwargs)
+
+    @property
+    def default_message(self):
+        values = ', '.join(str(v) for v in self.options)
+        return 'is not in the list of legal options ({})'.format(values)
+
+    def validate(self, df: pd.DataFrame) -> pd.Series:
+        def is_element_in_list(series):
+            if self.case_sensitive:
+                return series.isin(self.options)
+            else:
+                return series.str.lower().isin([s.lower() for s in self.options])
+
+        return df.apply(is_element_in_list, axis=1).all(axis=1)
+
+
+class DateFormatValidation(_DataFrameValidation):
+    """
+    Checks that each element in this column is a valid date according to a provided format string
+    """
+
+    def __init__(self, date_format: str, **kwargs):
+        """
+        :param date_format: The date format string to validate the column against. Refer to the date format code
+            documentation at https://docs.python.org/3/library/datetime.html#strftime-and-strptime-behavior for a full
+            list of format codes
+        """
+        self.date_format = date_format
+        super().__init__(**kwargs)
+
+    @property
+    def default_message(self):
+        return 'does not match the date format string "{}"'.format(self.date_format)
+
+    def valid_date(self, val):
+        try:
+            datetime.datetime.strptime(val, self.date_format)
+            return True
+        except:
+            return False
+
+    def validate(self, df: pd.DataFrame) -> pd.Series:
+        return df.apply(lambda series: series.apply(self.valid_date), axis=1).all(axis=1)
+
+
+class InRangeValidation(_DataFrameValidation):
+    """
+    Checks that each element in the series is within a given numerical range
+    """
+
+    def __init__(self, min: float = -math.inf, max: float = math.inf, **kwargs):
+        """
+        :param min: The minimum (inclusive) value to accept
+        :param max: The maximum (exclusive) value to accept
+        """
+        self.min = min
+        self.max = max
+        super().__init__(**kwargs)
+
+    @property
+    def default_message(self):
+        return 'was not in the range [{}, {})'.format(self.min, self.max)
+
+    def _in_range(self, series):
+        series = pd.to_numeric(series)
+        return (series >= self.min) & (series < self.max)
+
+    def validate(self, df: pd.DataFrame) -> pd.Series:
+        return df.apply(self._in_range, axis=1).all(axis=1)
